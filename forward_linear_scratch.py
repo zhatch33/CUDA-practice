@@ -99,7 +99,7 @@ layer_output_cpu = layer_output.copy_to_host()
 
 
 
-#Now we'll try to chain some forward passes, expanding input dimensions before squeezing down to target dimensions:
+#Now time to chain some forward passes, expanding input dimensions before squeezing down to target dimensions:
 linear_1 = NumbaLinearLayer(batch_size, 10, 32)
 linear_2 = NumbaLinearLayer(batch_size, 32, 64)
 linear_3 = NumbaLinearLayer(batch_size, 64, 32)
@@ -123,34 +123,34 @@ for i in range(num_batches):
 
     #PERFORM LAYER PASSES BY INVOKING AND RUNNING KERNELS SEQUENTIALLY:
     #First layer pass - takes batch, applies linear_1 weights, results go into x_1
-    threads_per_block = (8,8)
-    blocks_per_grid_x = math.ceil(x_1.shape[0] / threads_per_block[0]) # 64 / 8 = 8
-    blocks_per_grid_y = math.ceil(x_1.shape[1] / threads_per_block[1]) # 32 / 8 = 4
-    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) #(8,4)
+    threads_per_block = (2,2)
+    blocks_per_grid_x = math.ceil(x_1.shape[0] / threads_per_block[0]) # 64 / 2 = 32
+    blocks_per_grid_y = math.ceil(x_1.shape[1] / threads_per_block[1]) # 32 / 2 =16
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) #(32,16)
     matmul_kernel[threads_per_block, blocks_per_grid](batch, linear_1.gpu_weights, x_1)
     #Second layer pass - takes x_1, applies linear_2 weights, results go into x_2
-    threads_per_block = (8,8)
-    blocks_per_grid_x = math.ceil(x_2.shape[0] / threads_per_block[0]) # 64 / 8 = 8
-    blocks_per_grid_y = math.ceil(x_2.shape[1] / threads_per_block[1]) # 64 / 8 = 8
-    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (8,8)
+    threads_per_block = (2,2)
+    blocks_per_grid_x = math.ceil(x_2.shape[0] / threads_per_block[0]) # 64 / 2 = 32
+    blocks_per_grid_y = math.ceil(x_2.shape[1] / threads_per_block[1]) # 64 / 2 = 32
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (32,32)
     matmul_kernel[threads_per_block, blocks_per_grid](x_1, linear_2.gpu_weights, x_2)
     #Third layer
-    threads_per_block = (8,8)
-    blocks_per_grid_x = math.ceil(x_3.shape[0] / threads_per_block[0]) # 64 / 8 = 8
-    blocks_per_grid_y = math.ceil(x_3.shape[1] / threads_per_block[1]) # 32 / 8 = 4
-    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (8,4)
+    threads_per_block = (2,2)
+    blocks_per_grid_x = math.ceil(x_3.shape[0] / threads_per_block[0]) # 64 / 2 = 16
+    blocks_per_grid_y = math.ceil(x_3.shape[1] / threads_per_block[1]) # 32 / 2 = 8
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (16,8)
     matmul_kernel[threads_per_block, blocks_per_grid](x_2, linear_3.gpu_weights, x_3)
     #Fourth layer
-    threads_per_block = (8,8)
-    blocks_per_grid_x = math.ceil(x_4.shape[0] / threads_per_block[0]) # 64 / 8 = 8
-    blocks_per_grid_y = math.ceil(x_4.shape[1] / threads_per_block[1])  #16 / 8 = 2
-    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+    threads_per_block = (2,2)
+    blocks_per_grid_x = math.ceil(x_4.shape[0] / threads_per_block[0]) # 64 / 2 = 32
+    blocks_per_grid_y = math.ceil(x_4.shape[1] / threads_per_block[1])  #16 / 2 = 8
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (32,8)
     matmul_kernel[threads_per_block, blocks_per_grid_x](x_3, linear_4.gpu_weights, x_4)
     #Output layer
-    threads_per_block = (8, 1)
-    blocks_per_grid_x = math.ceil(batch_output.shape[0] / threads_per_block[0]) # 64 / 8 = 8
+    threads_per_block = (2, 1)
+    blocks_per_grid_x = math.ceil(batch_output.shape[0] / threads_per_block[0]) # 64 / 2 = 32
     blocks_per_grid_y = math.ceil(batch_output.shape[1] / threads_per_block[1]) # 1 / 1 = 1
-    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y)
+    blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) #(32,1)
     matmul_kernel[threads_per_block, blocks_per_grid](x_4, output_layer.gpu_weights, batch_output)
 
     #Now we assign the final batch output to our destination tensor on the GPU
