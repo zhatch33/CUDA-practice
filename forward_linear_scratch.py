@@ -99,14 +99,13 @@ layer_output_cpu = layer_output.copy_to_host()
 
 
 
-#Now time to chain some forward passes, expanding input dimensions before squeezing down to target dimensions:
 linear_1 = NumbaLinearLayer(batch_size, 10, 32)
 linear_2 = NumbaLinearLayer(batch_size, 32, 64)
 linear_3 = NumbaLinearLayer(batch_size, 64, 32)
 linear_4 = NumbaLinearLayer(batch_size, 32, 16)
 output_layer = NumbaLinearLayer(batch_size, 16, 1)
 
-#Allocate memory of proper shape for our target tensor:
+#Allocate memory of proper shape for target tensor:
 pred_outputs = cuda.device_array_like(np.zeros(y_batched.shape))
 
 #Perform the passes on the input CPU tensor
@@ -127,34 +126,125 @@ for i in range(num_batches):
     blocks_per_grid_x = math.ceil(x_1.shape[0] / threads_per_block[0]) # 64 / 2 = 32
     blocks_per_grid_y = math.ceil(x_1.shape[1] / threads_per_block[1]) # 32 / 2 =16
     blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) #(32,16)
-    matmul_kernel[threads_per_block, blocks_per_grid](batch, linear_1.gpu_weights, x_1)
+    matmul_kernel[blocks_per_grid, threads_per_block](batch, linear_1.gpu_weights, x_1)
     #Second layer pass - takes x_1, applies linear_2 weights, results go into x_2
     threads_per_block = (2,2)
     blocks_per_grid_x = math.ceil(x_2.shape[0] / threads_per_block[0]) # 64 / 2 = 32
     blocks_per_grid_y = math.ceil(x_2.shape[1] / threads_per_block[1]) # 64 / 2 = 32
     blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (32,32)
-    matmul_kernel[threads_per_block, blocks_per_grid](x_1, linear_2.gpu_weights, x_2)
+    matmul_kernel[blocks_per_grid, threads_per_block](x_1, linear_2.gpu_weights, x_2)
     #Third layer
     threads_per_block = (2,2)
     blocks_per_grid_x = math.ceil(x_3.shape[0] / threads_per_block[0]) # 64 / 2 = 16
     blocks_per_grid_y = math.ceil(x_3.shape[1] / threads_per_block[1]) # 32 / 2 = 8
     blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (16,8)
-    matmul_kernel[threads_per_block, blocks_per_grid](x_2, linear_3.gpu_weights, x_3)
+    matmul_kernel[blocks_per_grid, threads_per_block](x_2, linear_3.gpu_weights, x_3)
     #Fourth layer
     threads_per_block = (2,2)
     blocks_per_grid_x = math.ceil(x_4.shape[0] / threads_per_block[0]) # 64 / 2 = 32
     blocks_per_grid_y = math.ceil(x_4.shape[1] / threads_per_block[1])  #16 / 2 = 8
     blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) # (32,8)
-    matmul_kernel[threads_per_block, blocks_per_grid_x](x_3, linear_4.gpu_weights, x_4)
+    matmul_kernel[blocks_per_grid_x, threads_per_block](x_3, linear_4.gpu_weights, x_4)
     #Output layer
     threads_per_block = (2, 1)
     blocks_per_grid_x = math.ceil(batch_output.shape[0] / threads_per_block[0]) # 64 / 2 = 32
     blocks_per_grid_y = math.ceil(batch_output.shape[1] / threads_per_block[1]) # 1 / 1 = 1
     blocks_per_grid = (blocks_per_grid_x, blocks_per_grid_y) #(32,1)
-    matmul_kernel[threads_per_block, blocks_per_grid](x_4, output_layer.gpu_weights, batch_output)
+    matmul_kernel[blocks_per_grid, threads_per_block](x_4, output_layer.gpu_weights, batch_output)
 
     #Now we assign the final batch output to our destination tensor on the GPU
     pred_outputs[i, :, :] = batch_output
 
-#The epoch passes with all operations taking place on GPU - at the end, we consolidate the result to CPU
+#The epoch passes with all operations taking place on GPU - at the end, result is consolidated to CPU
 pred_outputs_cpu = pred_outputs.copy_to_host()
+
+
+#Okay, now the basic flow of a dense forward pass is done - now, I'll calculate MSE on the results:
+@cuda.jit
+def mse_se_kernel(y_pred, y_true, errors):
+    x = cuda.grid(1)
+    if x < errors.shape[0]:
+        errors[x] = math.pow((y_pred[x] - y_true[x]), 2)
+@cuda.jit
+def scalar_division(input_array, scalar, output_array):
+    x = cuda.grid(1)
+    if x < output_array.shape[0]:
+        output_array[x] = input_array[x] / scalar
+
+@cuda.jit
+def mse_reduce_sum_kernel(input_array, output_array):
+
+    #First, declare the shared memory array - make sure it matches size of blocks passed to kernel:
+    shared_mem = cuda.shared.array(shape = (256,), dtype=np.float64)
+
+    #Then, get IDs for thread and block we're in, as well as global index:
+    tid = cuda.threadIdx.x #Which thread in block
+    bid = cuda.blockIdx.x #Which block in grid
+    idx = bid * cuda.blockDim.x + tid #Which thread index in the global input array
+
+    #Once we have the IDs, we can move every thread in the block from the global memory to shared memory in parallel
+    #First we check bounds:
+    if idx < input_array.shape[0]:
+        shared_mem[tid] = input_array[idx]
+    else:
+        shared_mem[tid] = 0.0
+
+    #Synchronize to ensure that all threads have written to shared memory:
+    cuda.syncthreads()
+
+    #Now we can implement the reduction algorithm - this algorithm processes a one dimension tensor in O(nlogn) time in parallel:
+    s = cuda.blockDim.x // 2
+    while s > 0:
+        #Only the first s threads in each block do work:
+        if tid < s:
+            shared_mem[tid] += shared_mem[tid + s]
+
+        #Synchronize threads to ensure they are done:
+        cuda.syncthreads()
+
+        #Divide stride by 2 for next iteration:
+        s //= 2
+
+    #At the end of the loop, take the resulting sum from thread 0 and set it to the output block in global memory:
+    if tid == 0:
+        output_array[bid] = shared_mem[0]
+
+mse_errors_gpu = cuda.device_array(y_batched.shape[0], dtype=np.float64)
+def calculate_mse(y_pred_batched, y_true_batched):
+    #Iterate over batches for prediction and target
+    for i in range(y_pred_batched.shape[0]):
+        #Move prediction and target to device
+        y_pred = cuda.to_device(y_pred_batched[i, :, :].squeeze())
+        y_true = cuda.to_device(y_true_batched[i, :, :].squeeze())
+
+        n_elements = y_pred.shape[0]
+        #Allocate memory for SE kernel output
+        errors = cuda.device_array_like(np.zeros((y_pred.shape)))
+        #Instantiate and run the SE kernel on batch
+        threads_per_block = 4
+        blocks_per_grid = (n_elements + threads_per_block - 1) // threads_per_block
+        mse_se_kernel[blocks_per_grid, threads_per_block](y_pred, y_true, errors)
+
+        #Allocate memory for the output from reduce sum
+        partial_sums = cuda.device_array_like(np.zeros((blocks_per_grid,)))
+        #Instantiate and run the reduce sum kernel on outputs from SE kernel, accepting one returned value per block of threads:
+        mse_reduce_sum_kernel[blocks_per_grid, threads_per_block](errors, partial_sums)
+
+        #If we have multiple blocks across the input matrix, we need to perform another reduction:
+        final_sum = cuda.device_array(1, dtype=np.float64)
+        if blocks_per_grid > 1:
+            #Configure smaller grid for second reduction
+            threads_for_reduction = min(blocks_per_grid, threads_per_block)
+            blocks_for_reduction = 1
+            #Instantiate and run kernel for second reduction
+            mse_reduce_sum_kernel[blocks_for_reduction, threads_for_reduction](partial_sums, final_sum)
+        else:
+            #Only one block
+            final_sum = partial_sums
+
+        #Allocate device memory to keep final division on device
+        batch_mse = cuda.device_array_like(final_sum)
+        scalar_division[1,1](final_sum, n_elements, batch_mse)
+        mse_errors_gpu[i] = batch_mse[0]
+
+calculate_mse(pred_outputs_cpu, y_batched)
